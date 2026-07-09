@@ -1,0 +1,12 @@
+# dependencies
+ui/node_modules/
+
+# build output
+ui/dist/
+
+# python cruft
+__pycache__/
+*.pyc
+
+# os / editor
+.DS_Store
