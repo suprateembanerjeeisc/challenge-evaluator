@@ -1,7 +1,7 @@
 import { useState, useMemo, useRef, useEffect } from "react"
 import {
-  Play, Loader2, Timer, Database, Rocket, ArrowUp, ArrowDown, ChevronsUpDown,
-  ChevronLeft, ChevronRight, Square, FolderOpen, X, Pencil,
+  Play, Loader2, Database, ArrowUp, ArrowDown, ChevronsUpDown,
+  ChevronLeft, ChevronRight, Square, X, Pencil, Download, ChevronUp, ChevronDown,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -9,9 +9,13 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { cn } from "@/lib/utils"
 import { MultiHistogram, type Bin, type Series } from "@/components/MultiHistogram"
 import { RunsInput } from "@/components/RunsInput"
+import { useToast } from "@/components/Toaster"
 
 const API = "http://127.0.0.1:8200"
 const MAX_PROJECTS = 10
+// the correct number of result rows for the 20-file challenge; any project whose
+// output differs from this is flagged red in the Result column.
+const EXPECTED_ROWS = 57099
 
 // Distinct, legible-on-dark palette; index = selection order.
 const PALETTE = [
@@ -19,17 +23,8 @@ const PALETTE = [
   "#34d399", "#fb7185", "#60a5fa", "#facc15", "#2dd4bf",
 ]
 
-// allow the non-standard directory-picker attributes on <input>
-declare module "react" {
-  interface InputHTMLAttributes<T> {
-    webkitdirectory?: string
-    directory?: string
-  }
-}
-
 interface RunResult {
   project: string
-  elapsed_seconds: number
   total_rows: number
   columns: string[]
   rows: string[][]
@@ -76,112 +71,136 @@ interface Proj {
   visible: boolean // shown in the comparison histogram
   lines: number // lines of code in the project's src/
   chars: number // characters of code in the project's src/
+  container?: string // docker container the project runs in
+  url?: string // source GitHub URL (shown alongside a renamed project)
+  pending?: boolean // true while a clone is still cloning/building
 }
 
-// count visual lines the way `wc`-style tools report displayed lines: newlines
-// plus a trailing partial line if the file doesn't end in one.
-function countLines(text: string): number {
-  if (!text) return 0
-  const nl = (text.match(/\n/g) || []).length
-  return nl + (text.endsWith("\n") ? 0 : 1)
-}
-
-// what counts toward the codebase size: every code file under src/, excluding
-// only the fixed RunScript.mac harness (identical boilerplate in every project,
-// not part of the scored solution), plus non-code noise — compiled/binary
-// artifacts, editor/OS junk (.DS_Store, dotfiles), and build caches.
-function isSourceFile(relPath: string): boolean {
-  const name = relPath.split("/").pop() || ""
-  if (name.startsWith(".")) return false // .DS_Store and other dotfiles
-  if (/(^|\/)__pycache__(\/|$)/.test(relPath)) return false
-  if (/(^|\/)runscript(\.mac)?$/i.test(relPath)) return false
-  return !/\.(so|pyc|pyo|o|a|dll|dylib|bin|png|jpg|jpeg|gif|ico|zip|gz)$/i.test(relPath)
-}
 
 export default function App() {
   // projects the user has opened (each validated to contain a RunScript)
   const [projects, setProjects] = useState<Proj[]>([])
   const [runs, setRuns] = useState(1)
-  const [error, setError] = useState<string | null>(null)
-  const folderInputRef = useRef<HTMLInputElement | null>(null)
+  const { toast } = useToast()
 
   const selected = projects.map((p) => p.folder) // convenience: ordered folders
-
-  // single-run table result (only when exactly one project × runs === 1)
-  const [result, setResult] = useState<RunResult | null>(null)
-  const [loading, setLoading] = useState(false)
 
   // multi-run benchmark: per-project live stats, and whether a benchmark is active
   const [bench, setBench] = useState<Record<string, BenchStats>>({})
   const [benching, setBenching] = useState(false)
+  // folders in the current run, captured at click time so the table + (empty)
+  // chart render immediately at 0/N — before the first result arrives.
+  const [runningFolders, setRunningFolders] = useState<string[]>([])
   const streamsRef = useRef<EventSource[]>([])
+
+  // GitHub-clone column state
+  const [repoUrl, setRepoUrl] = useState("")
+  // clones in flight — placeholder rows carry pending:true
+  const anyCloning = projects.some((p) => p.pending)
+
+  // result-CSV overlay: the project whose result table is open, its fetched data,
+  // and whether the fetch is in flight. `resultRows` caches each project's row
+  // count (fetched when its benchmark completes) for the Result column link.
+  const [resultPane, setResultPane] = useState<{ folder: string; label: string } | null>(null)
+  const [resultData, setResultData] = useState<RunResult | null>(null)
+  const [resultLoading, setResultLoading] = useState(false)
+  const [resultRows, setResultRows] = useState<Record<string, number>>({})
+
+  async function fetchRowCount(folder: string) {
+    try {
+      const res = await fetch(`${API}/result?project=${encodeURIComponent(folder)}`)
+      if (!res.ok) return
+      const data = await res.json()
+      setResultRows((cur) => ({ ...cur, [folder]: data.total_rows }))
+    } catch { /* leave uncounted; the link falls back to "view" */ }
+  }
+
+  async function openResult(folder: string, label: string) {
+    setResultPane({ folder, label })
+    setResultData(null)
+    setResultLoading(true)
+    try {
+      const res = await fetch(`${API}/result?project=${encodeURIComponent(folder)}`)
+      if (!res.ok) throw new Error(`server returned ${res.status}`)
+      setResultData(await res.json())
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "could not load result")
+      setResultPane(null)
+    } finally {
+      setResultLoading(false)
+    }
+  }
 
   // color is keyed to the folder's position, stable across renames
   const colorOf = (folder: string) => PALETTE[selected.indexOf(folder) % PALETTE.length]
 
-  // The browser can't give us an absolute path, but a directory <input> exposes
-  // the folder's files via relative paths. We use those to (a) confirm a
-  // RunScript is present and (b) read the top-level folder name, which is what
-  // docker-compose uses to name the container.
-  async function onFolderChosen(e: React.ChangeEvent<HTMLInputElement>) {
-    setError(null)
-    const files = Array.from(e.target.files ?? [])
-    e.target.value = "" // allow re-selecting the same folder later
-    if (files.length === 0) return
+  // derive the repo (folder) name from a GitHub URL — matches the backend, which
+  // clones into a directory named after the repo.
+  function repoNameFromUrl(url: string): string | null {
+    const m = url
+      .trim()
+      .match(/^(?:(?:https?:\/\/)?github\.com\/|git@github\.com:)[\w.-]+\/([\w.-]+?)(?:\.git)?\/?$/i)
+    return m ? m[1] : null
+  }
 
-    const firstPath = files[0].webkitRelativePath || files[0].name
-    const folder = firstPath.split("/")[0]
-
-    // RunScript lives at <folder>/src/RunScript.mac (case-insensitive match on the name)
-    const hasRunScript = files.some((f) =>
-      /(^|\/)runscript(\.mac)?$/i.test(f.webkitRelativePath || f.name)
-    )
-    if (!hasRunScript) {
-      setError(`"${folder}" does not contain a RunScript — pick the project folder (the one with src/RunScript.mac).`)
+  // clone a public GitHub repo. A placeholder row is added immediately so the
+  // clone/build runs in the background while the user keeps adding projects.
+  // On success the row fills in; on failure it's removed with a toast.
+  async function cloneRepo() {
+    const url = repoUrl.trim()
+    if (!url) return
+    const name = repoNameFromUrl(url)
+    if (!name) {
+      toast("Not a GitHub repo URL (expected github.com/owner/repo).")
       return
     }
-    if (selected.includes(folder)) {
-      setError(`"${folder}" is already added.`)
+    if (selected.includes(name)) {
+      toast(`"${name}" is already added.`)
       return
     }
-    if (selected.length >= MAX_PROJECTS) {
-      setError(`At most ${MAX_PROJECTS} projects can be compared at once.`)
-      return
-    }
-
-    // confirm the project's IRIS container is actually running
-    try {
-      const res = await fetch(`${API}/status?project=${encodeURIComponent(folder)}`)
-      const st = await res.json()
-      if (!st.running) {
-        setError(`"${folder}" has a RunScript, but its container (${st.container}) is not running. Start it with \`docker-compose up -d\` in that folder.`)
-        return
-      }
-    } catch {
-      setError("could not reach backend — is it running on :8200?")
+    if (projects.length >= MAX_PROJECTS) {
+      toast(`At most ${MAX_PROJECTS} projects can be compared at once.`)
       return
     }
 
-    // codebase size: count lines + characters across the source files under src/
-    let lines = 0
-    let chars = 0
-    const srcFiles = files.filter((f) => {
-      const rel = f.webkitRelativePath || f.name
-      return /(^|\/)src\//.test(rel) && isSourceFile(rel)
-    })
-    await Promise.all(
-      srcFiles.map(async (f) => {
-        const text = await f.text()
-        lines += countLines(text)
-        chars += text.length
-      })
-    )
+    // normalize to a canonical https URL for display
+    const displayUrl = url.replace(/\.git\/?$/, "").replace(/\/$/, "")
 
-    // adding a folder doesn't touch existing results — they persist in the table
+    // add the pending placeholder row and clear the field right away
     setProjects((cur) => [
       ...cur,
-      { folder, label: folder, enabled: true, visible: true, lines, chars },
+      { folder: name, label: name, enabled: false, visible: true, lines: 0, chars: 0, url: displayUrl, pending: true },
     ])
+    setRepoUrl("")
+
+    try {
+      const res = await fetch(`${API}/clone`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      })
+      if (!res.ok) {
+        let detail = `clone failed (${res.status})`
+        try {
+          detail = (await res.json()).detail || detail
+        } catch { /* keep default */ }
+        throw new Error(detail)
+      }
+      const p = await res.json()
+      if (!p.running) throw new Error(`Cloned "${p.name}", but its container (${p.container}) did not start.`)
+      // fill in the placeholder (reconcile in case the backend's folder name differs)
+      setProjects((cur) =>
+        cur.map((row) =>
+          row.folder === name
+            ? { ...row, folder: p.name, label: p.name, enabled: true, lines: p.lines ?? 0, chars: p.chars ?? 0, container: p.container, pending: false }
+            : row
+        )
+      )
+    } catch (e) {
+      // drop the placeholder on failure
+      setProjects((cur) => cur.filter((row) => row.folder !== name))
+      toast(e instanceof Error ? e.message : "clone failed")
+    }
   }
 
   function removeProject(folder: string) {
@@ -217,11 +236,15 @@ export default function App() {
   const enabledFolders = projects.filter((p) => p.enabled).map((p) => p.folder)
 
   function startBenchmark(folders: string[]) {
-    setResult(null)
-    setError(null)
+    setRunningFolders(folders)
     // clear only the folders being (re)run — keep results from earlier runs of
     // other projects so the table persists across separate runs.
     setBench((prev) => {
+      const next = { ...prev }
+      for (const f of folders) delete next[f]
+      return next
+    })
+    setResultRows((prev) => {
       const next = { ...prev }
       for (const f of folders) delete next[f]
       return next
@@ -230,10 +253,16 @@ export default function App() {
     const streams: EventSource[] = []
     let done = 0
     for (const name of folders) {
+      let gotData = false
       const es = new EventSource(`${API}/benchmark?project=${encodeURIComponent(name)}&runs=${runs}`)
       es.onmessage = (e) => {
+        const first = !gotData
+        gotData = true
         const data = JSON.parse(e.data) as BenchStats
         setBench((prev) => ({ ...prev, [name]: data }))
+        // the result CSV exists after the very first pass — fetch its row count
+        // then so the Result link is usable without waiting for all runs.
+        if (first) fetchRowCount(name)
       }
       es.addEventListener("done", () => {
         es.close()
@@ -241,6 +270,8 @@ export default function App() {
       })
       es.onerror = () => {
         es.close()
+        // a stream that dies before delivering any data is a real failure
+        if (!gotData) toast(`Benchmark failed for "${name}" — check the backend and container.`)
         if (++done === streams.length) setBenching(false)
       }
       streams.push(es)
@@ -248,37 +279,21 @@ export default function App() {
     streamsRef.current = streams
   }
 
-  async function runOnce(folder: string) {
-    setLoading(true)
-    setError(null)
-    setResult(null)
-    setBench({})
-    try {
-      const res = await fetch(`${API}/run?project=${encodeURIComponent(folder)}`)
-      if (!res.ok) throw new Error(`server returned ${res.status}`)
-      setResult(await res.json())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "run failed")
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  // A single run of a single project shows the results table; anything else
-  // (multiple projects, or runs > 1) shows the timing comparison.
-  const isComparison = enabledFolders.length > 1 || runs > 1
+  // Every run — even a single pass of one project — goes through the benchmark
+  // path, so the stats table + histogram always render and each project's result
+  // CSV is reached via the Result column. `runs === 1` just streams one sample.
   function handleRun() {
     if (enabledFolders.length === 0) return
-    if (isComparison) startBenchmark(enabledFolders)
-    else runOnce(enabledFolders[0])
+    startBenchmark(enabledFolders)
   }
 
-  const busy = loading || benching
+  const busy = benching
   const canRun = enabledFolders.length > 0 && !busy
 
-  // projects that have benchmark results (persist across separate runs, even if
-  // later unselected), in selection order.
-  const benchedProjects = projects.filter((p) => bench[p.folder])
+  // projects shown in the comparison view: those with results (persist across
+  // separate runs, even if later unselected) plus any in the current run — the
+  // latter so the table + chart appear immediately at 0/N before results land.
+  const benchedProjects = projects.filter((p) => bench[p.folder] || runningFolders.includes(p.folder))
 
   // build histogram series for benched + visible projects
   const series: Series[] = useMemo(
@@ -287,14 +302,16 @@ export default function App() {
         .filter((p) => p.visible)
         .map((p) => ({ name: p.label, color: colorOf(p.folder), bins: bench[p.folder]?.histogram ?? [] }))
         .filter((s) => s.bins.length > 0),
-    [projects, bench]
+    [projects, bench, runningFolders]
   )
   const anyBench = benchedProjects.length > 0
 
-  // a benchmarked project is "still running" until its live run count reaches the total
+  // a project in the current run is "still running" until its live run count
+  // reaches the total (or before its first result arrives).
   const isRunning = (folder: string) => {
+    if (!benching || !runningFolders.includes(folder)) return false
     const b = bench[folder]
-    return benching && (!b || b.run < b.total)
+    return !b || b.run < b.total
   }
 
   return (
@@ -321,7 +338,7 @@ export default function App() {
         <Card className="mb-6">
           <CardContent className="pt-6">
             <div className="flex flex-col gap-5">
-              {/* folder picker + added projects (one per line, editable titles) */}
+              {/* project picker: added projects (left) + add-by-source (right) */}
               <div>
                 <div className="mb-2 flex items-center justify-between">
                   <label className="text-sm font-medium">
@@ -331,39 +348,52 @@ export default function App() {
                     </span>
                   </label>
                 </div>
+                {/* full-width list of added projects */}
+                {projects.length > 0 && (
+                  <div className="mb-4 flex flex-col gap-2">
+                    {projects.map((p) => (
+                      <ProjectRow
+                        key={p.folder}
+                        proj={p}
+                        color={colorOf(p.folder)}
+                        disabled={busy}
+                        onToggleEnabled={() => toggleEnabled(p.folder)}
+                        onRename={(label) => renameProject(p.folder, label)}
+                        onRemove={() => removeProject(p.folder)}
+                      />
+                    ))}
+                  </div>
+                )}
+
+                {/* add a project by cloning a public GitHub repo */}
                 <div className="flex flex-col gap-2">
-                  {projects.map((p) => (
-                    <ProjectRow
-                      key={p.folder}
-                      proj={p}
-                      color={colorOf(p.folder)}
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="url"
+                      value={repoUrl}
                       disabled={busy}
-                      onToggleEnabled={() => toggleEnabled(p.folder)}
-                      onRename={(label) => renameProject(p.folder, label)}
-                      onRemove={() => removeProject(p.folder)}
+                      placeholder="https://github.com/owner/repo"
+                      onChange={(e) => setRepoUrl(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") cloneRepo()
+                      }}
+                      className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
                     />
-                  ))}
-                  <input
-                    ref={folderInputRef}
-                    type="file"
-                    webkitdirectory=""
-                    directory=""
-                    multiple
-                    className="hidden"
-                    onChange={onFolderChosen}
-                  />
-                  <button
-                    onClick={() => folderInputRef.current?.click()}
-                    disabled={busy || selected.length >= MAX_PROJECTS}
-                    className="inline-flex w-full items-center justify-center gap-2 rounded-md border border-dashed border-input px-3 py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:border-primary hover:text-foreground disabled:opacity-40"
-                  >
-                    <FolderOpen className="h-4 w-4" />
-                    Open folder…
-                  </button>
+                    <button
+                      onClick={cloneRepo}
+                      disabled={busy || !repoUrl.trim() || projects.length >= MAX_PROJECTS}
+                      title="clone & add repository"
+                      className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                    >
+                      <Download className="h-4 w-4" />
+                    </button>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {anyCloning
+                      ? "Cloning in the background — you can add more while it builds."
+                      : "Paste a public GitHub repo URL to clone, build, and add it."}
+                  </p>
                 </div>
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Open a project folder containing <code className="text-primary">src/RunScript.mac</code>. Check the box to include it in the run, click a title to rename it. Add up to {MAX_PROJECTS} to compare.
-                </p>
               </div>
 
               {/* runs + run button */}
@@ -381,7 +411,7 @@ export default function App() {
                     ) : (
                       <>
                         <Play className="h-4 w-4" />
-                        {isComparison ? `Run ×${runs}` : "Run"}
+                        {runs > 1 ? `Run ×${runs}` : "Run"}
                       </>
                     )}
                   </Button>
@@ -394,11 +424,10 @@ export default function App() {
               </div>
 
               <p className="text-xs text-muted-foreground">
-                {isComparison
+                {runs > 1
                   ? `Runs each selected project ${runs}× and overlays their run-time distributions.`
-                  : "Runs the selected project once and shows the result rows."}
+                  : "Runs each selected project once and shows its timing and result."}
               </p>
-              {error && <p className="text-sm text-red-400">Error: {error}</p>}
             </div>
           </CardContent>
         </Card>
@@ -419,15 +448,22 @@ export default function App() {
                         <th className="px-3 py-3 text-right font-medium text-yellow-400">Mean</th>
                         <th className="px-3 py-3 text-right font-medium text-yellow-400">Median</th>
                         <th className="px-3 py-3 text-right font-medium text-sky-400">Lines</th>
-                        <th className="px-4 py-3 text-right font-medium text-sky-400">Characters</th>
+                        <th className="px-3 py-3 text-right font-medium text-sky-400">Characters</th>
+                        <th className="px-4 py-3 text-right font-medium text-emerald-400">Result</th>
                       </tr>
                     </thead>
                     <tbody>
                       {projects
-                        .filter((p) => p.enabled || bench[p.folder])
+                        .filter((p) => p.enabled || bench[p.folder] || runningFolders.includes(p.folder))
                         .map((p) => {
                           const b = bench[p.folder]
                           const running = isRunning(p.folder)
+                          // count to show: live from data, else 0/N while queued
+                          const counter = b
+                            ? `${b.run}/${b.total}`
+                            : runningFolders.includes(p.folder)
+                            ? `0/${runs}`
+                            : null
                           return (
                             <tr key={p.folder} className="border-b last:border-0">
                               <td className="px-4 py-3">
@@ -443,10 +479,8 @@ export default function App() {
                                     )}
                                   </span>
                                   <span className="truncate font-medium">{p.label}</span>
-                                  {b && (
-                                    <span className="text-xs text-muted-foreground">
-                                      {b.run}/{b.total}
-                                    </span>
+                                  {counter && (
+                                    <span className="text-xs text-muted-foreground">{counter}</span>
                                   )}
                                 </div>
                               </td>
@@ -457,8 +491,32 @@ export default function App() {
                               <td className="px-3 py-3 text-right font-mono tabular-nums text-sky-400">
                                 {p.lines.toLocaleString()}
                               </td>
-                              <td className="px-4 py-3 text-right font-mono tabular-nums text-sky-400">
+                              <td className="px-3 py-3 text-right font-mono tabular-nums text-sky-400">
                                 {p.chars.toLocaleString()}
+                              </td>
+                              <td className="px-4 py-3 text-right">
+                                {resultRows[p.folder] != null ? (
+                                  <button
+                                    onClick={() => openResult(p.folder, p.label)}
+                                    title={
+                                      resultRows[p.folder] === EXPECTED_ROWS
+                                        ? "view result rows"
+                                        : `expected ${EXPECTED_ROWS.toLocaleString()} rows`
+                                    }
+                                    className={cn(
+                                      "font-mono tabular-nums underline decoration-dotted underline-offset-2",
+                                      resultRows[p.folder] === EXPECTED_ROWS
+                                        ? "text-emerald-400 hover:text-emerald-300"
+                                        : "text-red-400 hover:text-red-300"
+                                    )}
+                                  >
+                                    {resultRows[p.folder].toLocaleString()}
+                                  </button>
+                                ) : b ? (
+                                  <span className="text-muted-foreground">…</span>
+                                ) : (
+                                  <span className="text-muted-foreground">—</span>
+                                )}
                               </td>
                             </tr>
                           )
@@ -507,17 +565,45 @@ export default function App() {
           </div>
         )}
 
-        {/* single-run results table */}
-        {result && !anyBench && (
-          <ResultsTable result={result} />
-        )}
-
-        {!result && !busy && !anyBench && (
+        {!busy && !anyBench && (
           <p className="text-center text-sm text-muted-foreground">
-            Open one or more project folders, check the ones to run, set the run count, and press Run.
+            Add one or more projects, check the ones to run, set the run count, and press Run.
           </p>
         )}
       </div>
+
+      {/* result-CSV overlay pane */}
+      {resultPane && (
+        <div
+          className="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm sm:p-8"
+          onClick={() => setResultPane(null)}
+        >
+          <div
+            className="relative w-full max-w-5xl rounded-xl border border-border bg-card p-6 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-4 flex items-center justify-between gap-4">
+              <h2 className="text-lg font-semibold">
+                Result &mdash; <span className="text-emerald-400">{resultPane.label}</span>
+              </h2>
+              <button
+                onClick={() => setResultPane(null)}
+                aria-label="close"
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            {resultLoading || !resultData ? (
+              <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" /> loading result…
+              </div>
+            ) : (
+              <ResultsTable result={resultData} />
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -545,6 +631,24 @@ function ProjectRow({
   function commit() {
     onRename(draft.trim())
     setEditing(false)
+  }
+
+  // still cloning/building: show a spinner + status; only removal is allowed
+  if (proj.pending) {
+    return (
+      <div className="flex items-center gap-3 rounded-md border border-dashed border-input bg-background px-3 py-2">
+        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
+        <span className="truncate text-sm font-medium">{proj.label}</span>
+        <span className="flex-1 truncate text-xs text-muted-foreground">cloning &amp; building…</span>
+        <button
+          onClick={onRemove}
+          title="cancel"
+          className="shrink-0 rounded-full p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+    )
   }
 
   return (
@@ -583,8 +687,25 @@ function ProjectRow({
           <Pencil className="h-3 w-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
         </button>
       )}
-      {proj.label !== proj.folder && (
-        <span className="hidden shrink-0 truncate text-xs text-muted-foreground sm:inline">{proj.folder}</span>
+      {proj.container && (
+        <span
+          title={`container: ${proj.container}`}
+          className="hidden shrink-0 truncate rounded bg-secondary px-1.5 py-0.5 font-mono text-xs text-muted-foreground sm:inline"
+        >
+          {proj.container}
+        </span>
+      )}
+      {proj.url && (
+        <a
+          href={proj.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          title={proj.url}
+          className="hidden max-w-[16rem] shrink-0 truncate text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground sm:inline"
+        >
+          {proj.url.replace(/^https?:\/\//, "")}
+        </a>
       )}
       <button
         onClick={onRemove}
@@ -641,37 +762,52 @@ function ResultsTable({ result }: { result: RunResult }) {
     setPage(0)
   }
 
+  const mismatch = result.total_rows !== EXPECTED_ROWS
   return (
     <>
-      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatCard icon={Timer} label="Elapsed time" value={`${result.elapsed_seconds}s`} accent />
-        <StatCard icon={Database} label="Objects > 100%" value={result.total_rows.toLocaleString()} />
-        <StatCard icon={Rocket} label="Project" value={result.project} />
-      </div>
-
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center justify-between">
             <span>Results</span>
             <span className="text-sm font-normal text-muted-foreground">
               {editingLimit ? (
-                <input
-                  autoFocus
-                  type="number"
-                  min={1}
-                  max={MAX_PAGE_SIZE}
-                  defaultValue={pageSize}
-                  onBlur={(e) => {
-                    const n = parseInt(e.target.value, 10)
-                    if (!isNaN(n)) setPageSizeClamped(n)
-                    setEditingLimit(false)
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") (e.target as HTMLInputElement).blur()
-                    if (e.key === "Escape") setEditingLimit(false)
-                  }}
-                  className="w-20 rounded border border-input bg-background px-1 py-0.5 text-center font-semibold text-primary outline-none focus:ring-2 focus:ring-ring"
-                />
+                <span className="inline-flex items-center overflow-hidden rounded-md border border-input bg-background align-middle focus-within:ring-2 focus-within:ring-ring">
+                  <input
+                    autoFocus
+                    type="text"
+                    inputMode="numeric"
+                    value={pageSize}
+                    onChange={(e) => {
+                      const n = parseInt(e.target.value.replace(/[^\d]/g, ""), 10)
+                      if (!isNaN(n)) setPageSizeClamped(n)
+                    }}
+                    onBlur={() => setEditingLimit(false)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === "Escape") setEditingLimit(false)
+                    }}
+                    className="w-14 bg-transparent px-2 py-0.5 text-center font-semibold text-primary outline-none"
+                  />
+                  <span className="flex flex-col border-l border-input">
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => setPageSizeClamped(pageSize + 10)}
+                      className="flex h-[13px] items-center justify-center px-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+                    >
+                      <ChevronUp className="h-3 w-3" />
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => setPageSizeClamped(pageSize - 10)}
+                      className="flex h-[13px] items-center justify-center border-t border-input px-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+                    >
+                      <ChevronDown className="h-3 w-3" />
+                    </button>
+                  </span>
+                </span>
               ) : (
                 <button
                   onClick={() => setEditingLimit(true)}
@@ -681,7 +817,14 @@ function ResultsTable({ result }: { result: RunResult }) {
                   {pageSize}
                 </button>
               )}{" "}
-              rows/page · {result.total_rows.toLocaleString()} total
+              rows/page ·{" "}
+              <span
+                className={cn("font-semibold", mismatch ? "text-red-400" : "text-foreground")}
+                title={mismatch ? `expected ${EXPECTED_ROWS.toLocaleString()} rows` : undefined}
+              >
+                {result.total_rows.toLocaleString()}
+              </span>{" "}
+              total{mismatch && ` (expected ${EXPECTED_ROWS.toLocaleString()})`}
             </span>
           </CardTitle>
         </CardHeader>
@@ -756,32 +899,3 @@ function ResultsTable({ result }: { result: RunResult }) {
   )
 }
 
-function StatCard({
-  icon: Icon,
-  label,
-  value,
-  accent,
-}: {
-  icon: typeof Timer
-  label: string
-  value: string
-  accent?: boolean
-}) {
-  return (
-    <Card>
-      <CardContent className="flex items-center gap-3 p-5">
-        <div
-          className={`flex h-10 w-10 items-center justify-center rounded-lg ${
-            accent ? "bg-primary/15 ring-1 ring-primary/30" : "bg-secondary"
-          }`}
-        >
-          <Icon className={`h-5 w-5 ${accent ? "text-primary" : "text-muted-foreground"}`} />
-        </div>
-        <div>
-          <div className="text-xs text-muted-foreground">{label}</div>
-          <div className={`text-lg font-semibold ${accent ? "text-primary" : ""}`}>{value}</div>
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
