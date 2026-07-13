@@ -1,7 +1,8 @@
 import { useState, useMemo, useRef, useEffect } from "react"
 import {
   Play, Loader2, Database, ArrowUp, ArrowDown, ChevronsUpDown,
-  ChevronLeft, ChevronRight, Square, X, Pencil, Download, ChevronUp, ChevronDown,
+  ChevronLeft, ChevronRight, Square, X, Pencil, Download, ChevronUp, ChevronDown, Settings,
+  AlertTriangle,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -16,6 +17,8 @@ const MAX_PROJECTS = 10
 // the correct number of result rows for the 20-file challenge; any project whose
 // output differs from this is flagged red in the Result column.
 const EXPECTED_ROWS = 57099
+// the ObjectScript command each run executes in the container (editable per project)
+const DEFAULT_COMMAND = "do ^RunScript"
 
 // Distinct, legible-on-dark palette; index = selection order.
 const PALETTE = [
@@ -73,12 +76,14 @@ interface Proj {
   chars: number // characters of code in the project's src/
   container?: string // docker container the project runs in
   url?: string // source GitHub URL (shown alongside a renamed project)
+  command: string // ObjectScript command the run/benchmark executes
+  warnings?: string[] // reasons the project can't run (shown on hover)
   pending?: boolean // true while a clone is still cloning/building
 }
 
 
 export default function App() {
-  // projects the user has opened (each validated to contain a RunScript)
+  // projects the user has cloned (each a repo with a docker-compose file)
   const [projects, setProjects] = useState<Proj[]>([])
   const [runs, setRuns] = useState(1)
   const { toast } = useToast()
@@ -97,6 +102,9 @@ export default function App() {
   const [repoUrl, setRepoUrl] = useState("")
   // clones in flight — placeholder rows carry pending:true
   const anyCloning = projects.some((p) => p.pending)
+
+  // settings overlay: the folder whose settings pane is open (or null)
+  const [settingsFolder, setSettingsFolder] = useState<string | null>(null)
 
   // result-CSV overlay: the project whose result table is open, its fetched data,
   // and whether the fetch is in flight. `resultRows` caches each project's row
@@ -135,12 +143,14 @@ export default function App() {
   const colorOf = (folder: string) => PALETTE[selected.indexOf(folder) % PALETTE.length]
 
   // derive the repo (folder) name from a GitHub URL — matches the backend, which
-  // clones into a directory named after the repo.
+  // clones into a directory named after the repo. Lenient: accepts optional
+  // scheme/www, SSH form, and ignores any trailing path/query/fragment
+  // (e.g. /tree/main), so only owner/repo need be present.
   function repoNameFromUrl(url: string): string | null {
     const m = url
       .trim()
-      .match(/^(?:(?:https?:\/\/)?github\.com\/|git@github\.com:)[\w.-]+\/([\w.-]+?)(?:\.git)?\/?$/i)
-    return m ? m[1] : null
+      .match(/(?:github\.com[/:])([\w.-]+)\/([\w.-]+?)(?:\.git)?(?:[/?#].*)?$/i)
+    return m ? m[2] : null
   }
 
   // clone a public GitHub repo. A placeholder row is added immediately so the
@@ -169,7 +179,7 @@ export default function App() {
     // add the pending placeholder row and clear the field right away
     setProjects((cur) => [
       ...cur,
-      { folder: name, label: name, enabled: false, visible: true, lines: 0, chars: 0, url: displayUrl, pending: true },
+      { folder: name, label: name, enabled: false, visible: true, lines: 0, chars: 0, url: displayUrl, command: DEFAULT_COMMAND, pending: true },
     ])
     setRepoUrl("")
 
@@ -187,17 +197,28 @@ export default function App() {
         throw new Error(detail)
       }
       const p = await res.json()
-      if (!p.running) throw new Error(`Cloned "${p.name}", but its container (${p.container}) did not start.`)
-      // fill in the placeholder (reconcile in case the backend's folder name differs)
+      const warnings: string[] = p.warnings ?? []
+      // The repo is kept even if it can't run — any problems come back as
+      // warnings shown on hover. Only auto-select it if it started AND has no
+      // warnings; anything flagged stays unchecked so it's excluded from runs.
       setProjects((cur) =>
         cur.map((row) =>
           row.folder === name
-            ? { ...row, folder: p.name, label: p.name, enabled: true, lines: p.lines ?? 0, chars: p.chars ?? 0, container: p.container, pending: false }
+            ? {
+                ...row, folder: p.name, label: p.name,
+                enabled: !!p.running && warnings.length === 0,
+                lines: p.lines ?? 0, chars: p.chars ?? 0, container: p.container,
+                warnings, pending: false,
+              }
             : row
         )
       )
+      // a re-clone rebuilds the container fresh (empty output) — discard any
+      // stale results/row counts for this project so it reads "not run yet".
+      setBench((prev) => { const n = { ...prev }; delete n[name]; delete n[p.name]; return n })
+      setResultRows((prev) => { const n = { ...prev }; delete n[name]; delete n[p.name]; return n })
     } catch (e) {
-      // drop the placeholder on failure
+      // a hard failure (network, git clone, non-public repo) — drop the placeholder
       setProjects((cur) => cur.filter((row) => row.folder !== name))
       toast(e instanceof Error ? e.message : "clone failed")
     }
@@ -210,11 +231,26 @@ export default function App() {
       delete next[folder]
       return next
     })
+    setResultRows((prev) => {
+      const next = { ...prev }
+      delete next[folder]
+      return next
+    })
     setProjects((cur) => cur.filter((p) => p.folder !== folder))
+    // tear down the container + delete the cloned checkout on the backend
+    fetch(`${API}/remove`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project: folder }),
+    }).catch(() => { /* best-effort; the row is already gone from the UI */ })
   }
 
   function renameProject(folder: string, label: string) {
     setProjects((cur) => cur.map((p) => (p.folder === folder ? { ...p, label: label || folder } : p)))
+  }
+
+  function setProjectCommand(folder: string, command: string) {
+    setProjects((cur) => cur.map((p) => (p.folder === folder ? { ...p, command: command || DEFAULT_COMMAND } : p)))
   }
 
   function toggleVisible(folder: string) {
@@ -222,7 +258,12 @@ export default function App() {
   }
 
   function toggleEnabled(folder: string) {
-    setProjects((cur) => cur.map((p) => (p.folder === folder ? { ...p, enabled: !p.enabled } : p)))
+    setProjects((cur) =>
+      cur.map((p) =>
+        // never enable a project that has warnings (it can't run correctly)
+        p.folder === folder && !(p.warnings?.length) ? { ...p, enabled: !p.enabled } : p
+      )
+    )
   }
 
   function stopAll() {
@@ -233,7 +274,20 @@ export default function App() {
 
   useEffect(() => () => stopAll(), [])
 
-  const enabledFolders = projects.filter((p) => p.enabled).map((p) => p.folder)
+  // On every page load, sweep evaluator-cloned repos so we start from a clean
+  // slate (containers torn down, checkouts deleted). Marker-guarded on the
+  // backend, so the user's own projects are never touched.
+  useEffect(() => {
+    fetch(`${API}/sweep`, { method: "POST" }).catch(() => { /* best-effort */ })
+    setProjects([])
+    setBench({})
+    setResultRows({})
+  }, [])
+
+  // a project runs only if selected AND free of warnings (can't-run reasons)
+  const enabledFolders = projects
+    .filter((p) => p.enabled && !(p.warnings?.length))
+    .map((p) => p.folder)
 
   function startBenchmark(folders: string[]) {
     setRunningFolders(folders)
@@ -254,7 +308,10 @@ export default function App() {
     let done = 0
     for (const name of folders) {
       let gotData = false
-      const es = new EventSource(`${API}/benchmark?project=${encodeURIComponent(name)}&runs=${runs}`)
+      const cmd = projects.find((p) => p.folder === name)?.command || DEFAULT_COMMAND
+      const es = new EventSource(
+        `${API}/benchmark?project=${encodeURIComponent(name)}&runs=${runs}&command=${encodeURIComponent(cmd)}`
+      )
       es.onmessage = (e) => {
         const first = !gotData
         gotData = true
@@ -268,9 +325,21 @@ export default function App() {
         es.close()
         if (++done === streams.length) setBenching(false)
       })
+      // backend-reported per-run failure (container gone, bad command, etc.)
+      es.addEventListener("error", (e) => {
+        es.close()
+        let detail = `Run failed for "${name}".`
+        try {
+          const d = JSON.parse((e as MessageEvent).data)
+          if (d?.detail) detail = `"${name}": ${d.detail}`
+        } catch { /* not a data-bearing error event */ }
+        toast(detail)
+        if (++done === streams.length) setBenching(false)
+      })
       es.onerror = () => {
         es.close()
-        // a stream that dies before delivering any data is a real failure
+        // a stream that dies before delivering any data (and without an explicit
+        // error event) is a transport-level failure
         if (!gotData) toast(`Benchmark failed for "${name}" — check the backend and container.`)
         if (++done === streams.length) setBenching(false)
       }
@@ -316,7 +385,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen w-full">
-      <div className="mx-auto max-w-5xl px-6 py-10">
+      <div className="mx-auto max-w-6xl px-6 py-10">
         {/* header */}
         <header className="mb-8">
           <div className="flex items-center gap-3">
@@ -360,6 +429,7 @@ export default function App() {
                         onToggleEnabled={() => toggleEnabled(p.folder)}
                         onRename={(label) => renameProject(p.folder, label)}
                         onRemove={() => removeProject(p.folder)}
+                        onOpenSettings={() => setSettingsFolder(p.folder)}
                       />
                     ))}
                   </div>
@@ -495,7 +565,7 @@ export default function App() {
                                 {p.chars.toLocaleString()}
                               </td>
                               <td className="px-4 py-3 text-right">
-                                {resultRows[p.folder] != null ? (
+                                {resultRows[p.folder] ? (
                                   <button
                                     onClick={() => openResult(p.folder, p.label)}
                                     title={
@@ -579,7 +649,7 @@ export default function App() {
           onClick={() => setResultPane(null)}
         >
           <div
-            className="relative w-full max-w-5xl rounded-xl border border-border bg-card p-6 shadow-2xl"
+            className="relative w-full max-w-6xl rounded-xl border border-border bg-card p-6 shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-4 flex items-center justify-between gap-4">
@@ -604,7 +674,88 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* per-project settings overlay */}
+      {settingsFolder && (() => {
+        const proj = projects.find((p) => p.folder === settingsFolder)
+        if (!proj) return null
+        return (
+          <div
+            className="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm sm:p-8"
+            onClick={() => setSettingsFolder(null)}
+          >
+            <div
+              className="relative mt-16 w-full max-w-lg rounded-xl border border-border bg-card p-6 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="mb-4 flex items-center justify-between gap-4">
+                <h2 className="text-lg font-semibold">
+                  Settings &mdash; <span className="text-primary">{proj.label}</span>
+                </h2>
+                <button
+                  onClick={() => setSettingsFolder(null)}
+                  aria-label="close"
+                  className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <label className="mb-2 block text-sm font-medium">Run command</label>
+              <input
+                type="text"
+                value={proj.command}
+                spellCheck={false}
+                onChange={(e) => setProjectCommand(proj.folder, e.target.value)}
+                placeholder={DEFAULT_COMMAND}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-ring"
+              />
+              <p className="mt-2 text-xs text-muted-foreground">
+                The ObjectScript command executed in the container on each run. Defaults to{" "}
+                <code className="text-primary">{DEFAULT_COMMAND}</code>.
+              </p>
+              <div className="mt-4 flex justify-end gap-2">
+                <Button
+                  variant="outline"
+                  onClick={() => setProjectCommand(proj.folder, DEFAULT_COMMAND)}
+                >
+                  Reset
+                </Button>
+                <Button onClick={() => setSettingsFolder(null)}>Done</Button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
     </div>
+  )
+}
+
+// Amber warning icon with a hover tooltip listing why a project can't run.
+function WarningBadge({ warnings }: { warnings: string[] }) {
+  const [show, setShow] = useState(false)
+  return (
+    <span
+      className="relative flex shrink-0"
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+    >
+      <AlertTriangle className="h-4 w-4 text-amber-400" />
+      {show && (
+        <div className="absolute left-0 top-full z-20 mt-1.5 w-80 max-w-[80vw] rounded-md border border-amber-500/40 bg-card p-3 text-left shadow-xl">
+          <div className="mb-1.5 text-xs font-semibold text-amber-400">
+            Cannot run ({warnings.length} {warnings.length === 1 ? "reason" : "reasons"})
+          </div>
+          <ul className="space-y-2">
+            {warnings.map((w, i) => (
+              <li key={i} className="whitespace-pre-wrap break-words font-mono text-[11px] leading-snug text-muted-foreground">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </span>
   )
 }
 
@@ -615,6 +766,7 @@ function ProjectRow({
   onToggleEnabled,
   onRename,
   onRemove,
+  onOpenSettings,
 }: {
   proj: Proj
   color: string
@@ -622,6 +774,7 @@ function ProjectRow({
   onToggleEnabled: () => void
   onRename: (label: string) => void
   onRemove: () => void
+  onOpenSettings: () => void
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(proj.label)
@@ -651,16 +804,21 @@ function ProjectRow({
     )
   }
 
+  const hasWarnings = (proj.warnings?.length ?? 0) > 0
   return (
     <div className="flex items-center gap-3 rounded-md border border-input bg-background px-3 py-2">
       <Checkbox
         checked={proj.enabled}
-        disabled={disabled}
+        disabled={disabled || hasWarnings}
         onCheckedChange={onToggleEnabled}
         color={color}
-        title={proj.enabled ? "selected to run" : "not selected"}
+        title={hasWarnings ? "cannot run — see warning" : proj.enabled ? "selected to run" : "not selected"}
       />
-      <span className="h-3 w-3 shrink-0 rounded-sm" style={{ backgroundColor: color }} />
+      {hasWarnings ? (
+        <WarningBadge warnings={proj.warnings!} />
+      ) : (
+        <span className="h-3 w-3 shrink-0 rounded-sm" style={{ backgroundColor: color }} />
+      )}
       {editing ? (
         <input
           autoFocus
@@ -707,6 +865,14 @@ function ProjectRow({
           {proj.url.replace(/^https?:\/\//, "")}
         </a>
       )}
+      <button
+        onClick={onOpenSettings}
+        disabled={disabled}
+        title="settings"
+        className="shrink-0 rounded-full p-1 text-muted-foreground hover:bg-secondary hover:text-foreground disabled:opacity-40"
+      >
+        <Settings className="h-4 w-4" />
+      </button>
       <button
         onClick={onRemove}
         disabled={disabled}
